@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import json
 import logging
 import os
+import time
 
 from database import init_db, get_db, ChatSession, Message, User, Document, DocumentChunk
 from auth import (
@@ -31,17 +32,29 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL_NAME = "gemini-3.5-flash"
+CHAT_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
 MAX_PDF_BYTES = 10 * 1024 * 1024
+CHAT_MAX_RETRIES = 5
+CHAT_RETRY_BASE_SECONDS = 1.0
+RETRYABLE_STATUS_CODES = {429, 503}
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+ALLOWED_ORIGINS = list(
+    dict.fromkeys(
+        [
+            FRONTEND_ORIGIN,
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
+    )
+)
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,8 +71,8 @@ def set_auth_cookie(response: Response, token: str) -> None:
         key=COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=True,
-        samesite="none",
+        secure=COOKIE_SECURE,
+        samesite="none" if COOKIE_SECURE else "lax",
         max_age=TOKEN_EXPIRE_MINUTES * 60,
         path="/",
     )
@@ -112,7 +125,12 @@ def login(
 
 @app.post("/logout")
 def logout(response: Response):
-    response.delete_cookie(key=COOKIE_NAME, path="/")
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        path="/",
+        secure=COOKIE_SECURE,
+        samesite="none" if COOKIE_SECURE else "lax",
+    )
     return {"detail": "Logged out"}
 
 
@@ -279,6 +297,50 @@ def build_generation_config(context: str | None):
     return types.GenerateContentConfig(system_instruction=instruction)
 
 
+def _is_retryable(error: APIError) -> bool:
+    return getattr(error, "code", None) in RETRYABLE_STATUS_CODES
+
+
+def _generate_content_with_fallback(contents, config):
+    last_error: APIError | None = None
+
+    for model in CHAT_MODELS:
+        for attempt in range(CHAT_MAX_RETRIES):
+            try:
+                return client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except APIError as exc:
+                last_error = exc
+                if not _is_retryable(exc) or attempt == CHAT_MAX_RETRIES - 1:
+                    break
+                time.sleep(CHAT_RETRY_BASE_SECONDS * (2**attempt))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Chat generation failed with no error details")
+
+
+def _stream_content_with_fallback(contents, config):
+    last_error: APIError | None = None
+
+    for model in CHAT_MODELS:
+        for attempt in range(CHAT_MAX_RETRIES):
+            try:
+                return client.models.generate_content_stream(
+                    model=model, contents=contents, config=config
+                )
+            except APIError as exc:
+                last_error = exc
+                if not _is_retryable(exc) or attempt == CHAT_MAX_RETRIES - 1:
+                    break
+                time.sleep(CHAT_RETRY_BASE_SECONDS * (2**attempt))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Chat stream failed with no error details")
+
+
 @app.post("/chat")
 def chat(
     req: ChatRequest,
@@ -296,9 +358,7 @@ def chat(
         )
 
     config = build_generation_config(context)
-    response = client.models.generate_content(
-        model=MODEL_NAME, contents=contents, config=config
-    )
+    response = _generate_content_with_fallback(contents, config)
 
     save_message(db, req.session_id, "user", req.message)
     save_message(db, req.session_id, "model", response.text)
@@ -327,13 +387,35 @@ def chat_stream(
 
     def event_generator():
         full_reply = ""
-        stream = client.models.generate_content_stream(
-            model=MODEL_NAME, contents=contents, config=config
-        )
-        for chunk in stream:
-            if chunk.text:
-                full_reply += chunk.text
-                yield chunk.text
+
+        try:
+            stream = _stream_content_with_fallback(contents, config)
+            for chunk in stream:
+                if chunk.text:
+                    full_reply += chunk.text
+                    yield chunk.text
+        except APIError:
+            logger.exception("Gemini stream failed")
+
+        if not full_reply:
+            try:
+                response = _generate_content_with_fallback(contents, config)
+                full_reply = response.text or ""
+                if full_reply:
+                    yield full_reply
+            except APIError as exc:
+                logger.exception("Gemini generate fallback failed")
+                detail = (
+                    "The AI service is busy. Please wait a moment and try again."
+                    if _is_retryable(exc)
+                    else "Failed to get a response from the AI."
+                )
+                yield f"\n\n<!--ERROR:{detail}-->"
+                return
+
+        if not full_reply:
+            yield "\n\n<!--ERROR:The AI didn't return a response. Try again.-->"
+            return
 
         save_message(db, req.session_id, "user", req.message)
         save_message(db, req.session_id, "model", full_reply)
@@ -341,7 +423,7 @@ def chat_stream(
         if sources:
             yield f"\n\n<!--SOURCES:{json.dumps(sources)}-->"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(event_generator(), media_type="text/plain; charset=utf-8")
 
 
 @app.get("/chat/{session_id}")

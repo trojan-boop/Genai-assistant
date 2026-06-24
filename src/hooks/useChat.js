@@ -59,9 +59,12 @@ export function useChat() {
           });
         }
 
-        const { text: finalText, sources } = parseSources(aiText);
+        const { text: finalText, sources, error: streamError } = parseSources(aiText);
 
-        if (!receivedAnyChunk) {
+        if (streamError) {
+          setError(streamError);
+          setMessages((prev) => prev.slice(0, -1));
+        } else if (!receivedAnyChunk) {
           setError("The AI didn't return a response. Try again.");
           setMessages((prev) => prev.slice(0, -1));
         } else {
